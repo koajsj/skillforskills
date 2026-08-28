@@ -42,8 +42,15 @@ const SOURCE_TRUST = {
   environment: ["custom", "来自环境变量授权的目录"],
   custom: ["custom", "来自用户明确添加的目录"],
 };
-const CHINESE_STOP_WORDS = [
+const MAX_CHINESE_PHRASE_LENGTH = 8;
+const CHINESE_BOUNDARY_WORDS = new Set([
+  "请",
+  "请问",
+  "帮",
   "帮我",
+  "我",
+  "我把",
+  "麻烦",
   "一下",
   "这个",
   "那个",
@@ -53,13 +60,35 @@ const CHINESE_STOP_WORDS = [
   "可以",
   "如何",
   "什么",
+  "把",
+  "将",
+  "给",
+  "对",
+  "的",
+  "为",
+  "并",
+  "并且",
+  "然后",
+  "同时",
+  "以及",
+  "或者",
+  "和",
+  "与",
+  "及",
+  "再",
+  "成",
+]);
+const CHINESE_FILLER_GROUPS = new Set([
   "任务",
   "功能",
-  "使用",
-  "相关",
-  "请问",
-  "请帮",
-];
+  "功能任务",
+  "相关任务",
+  "相关功能",
+]);
+const CHINESE_SEGMENTER =
+  typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter("zh-CN", { granularity: "word" })
+    : null;
 
 const CAPABILITIES = [
   {
@@ -637,53 +666,117 @@ export async function scanSkillInventory(
 function taskTokens(task) {
   const normalized = task.toLowerCase();
   const tokens = new Map();
-  const addToken = (value, weight) => {
+  const addToken = (value, weight, start, end) => {
     if (value.length < 2) return;
-    tokens.set(value, Math.max(tokens.get(value) || 0, weight));
-  };
-  const english = normalized.match(/[a-z0-9][a-z0-9+#._-]{1,}/g) || [];
-  for (const token of english) {
-    addToken(token, 1);
-    for (const part of token.split(/[-_.]/)) addToken(part, 0.9);
-  }
-  for (const run of normalized.match(/[\u3400-\u9fff]{2,}/g) || []) {
-    let segmented = run.slice(0, 60);
-    for (const stopWord of CHINESE_STOP_WORDS) {
-      segmented = segmented.split(stopWord).join(" ");
+    const key = `${start}:${end}:${value}`;
+    const current = tokens.get(key);
+    if (!current || weight > current.weight) {
+      tokens.set(key, { value, weight, start, end });
     }
-    for (const value of segmented.split(/\s+/).filter(Boolean)) {
-      if (value.length >= 2 && value.length <= 12) addToken(value, 2.8);
-      for (const size of [4, 3, 2]) {
-        if (size > value.length) continue;
-        const weight = size === 4 ? 2.2 : size === 3 ? 1.5 : 0.65;
-        for (let index = 0; index <= value.length - size; index += 1) {
-          const token = value.slice(index, index + size);
-          if (!CHINESE_STOP_WORDS.includes(token)) addToken(token, weight);
+  };
+  for (const match of normalized.matchAll(/[a-z0-9][a-z0-9+#._-]{1,}/g)) {
+    const token = match[0];
+    const start = match.index;
+    addToken(token, 1, start, start + token.length);
+    let cursor = 0;
+    for (const part of token.split(/[-_.]/)) {
+      const offset = token.indexOf(part, cursor);
+      addToken(part, 0.9, start + offset, start + offset + part.length);
+      cursor = offset + part.length;
+    }
+  }
+  for (const match of normalized.matchAll(/[\u3400-\u9fff]{2,}/g)) {
+    const run = match[0].slice(0, 80);
+    const groups = [];
+    let group = null;
+    const parts = CHINESE_SEGMENTER
+      ? [...CHINESE_SEGMENTER.segment(run)]
+      : [{ segment: run, index: 0, isWordLike: true }];
+    for (const part of parts) {
+      if (!part.isWordLike || CHINESE_BOUNDARY_WORDS.has(part.segment)) {
+        if (group) groups.push(group);
+        group = null;
+        continue;
+      }
+      if (!group) group = { value: part.segment, start: part.index };
+      else group.value += part.segment;
+    }
+    if (group) groups.push(group);
+    for (const item of groups) {
+      if (CHINESE_FILLER_GROUPS.has(item.value)) continue;
+      const maxSize = Math.min(MAX_CHINESE_PHRASE_LENGTH, item.value.length);
+      for (let size = maxSize; size >= 2; size -= 1) {
+        const baseWeight = size === 2 ? 0.7 : 1 + size * 0.8;
+        for (let index = 0; index <= item.value.length - size; index += 1) {
+          const start = match.index + item.start + index;
+          const exactGroup = size === item.value.length;
+          addToken(
+            item.value.slice(index, index + size),
+            baseWeight + (exactGroup ? 0.8 : 0),
+            start,
+            start + size,
+          );
         }
       }
     }
   }
-  return [...tokens.entries()]
-    .map(([value, weight]) => ({ value, weight }))
+  return [...tokens.values()]
     .sort(
       (left, right) =>
         right.weight - left.weight ||
         right.value.length - left.value.length ||
+        left.start - right.start ||
         left.value.localeCompare(right.value, "zh-CN"),
     )
-    .slice(0, 120);
+    .slice(0, 240);
+}
+
+function scoreTaskTokens(skill, tokens) {
+  const name = skill.qualifiedName.toLowerCase();
+  const description = `${skill.description}\n${skill.excerpt}`.toLowerCase();
+  const candidates = [];
+  for (const token of tokens) {
+    const target = name.includes(token.value)
+      ? "name"
+      : description.includes(token.value)
+        ? "description"
+        : null;
+    if (!target) continue;
+    const multiplier = target === "name" ? 4 : 1.2;
+    candidates.push({ ...token, target, points: token.weight * multiplier });
+  }
+  candidates.sort(
+    (left, right) =>
+      right.points - left.points ||
+      right.value.length - left.value.length ||
+      left.start - right.start ||
+      left.value.localeCompare(right.value, "zh-CN"),
+  );
+  const selected = [];
+  const selectedValues = new Set();
+  for (const candidate of candidates) {
+    if (selected.length >= 8 || selectedValues.has(candidate.value)) continue;
+    const overlaps = selected.some(
+      (current) => candidate.start < current.end && candidate.end > current.start,
+    );
+    if (overlaps) continue;
+    selected.push(candidate);
+    selectedValues.add(candidate.value);
+  }
+  return {
+    score: selected.reduce((total, item) => total + item.points, 0),
+    matchedTerms: selected
+      .sort((left, right) => left.start - right.start)
+      .map(({ value, target }) => ({ term: value, target })),
+  };
 }
 
 function scoreSkill(skill, task, detected, tokens) {
   const matched = detected.filter((item) => skill.capabilities.includes(item.id));
   const name = skill.qualifiedName.toLowerCase();
-  const description = `${skill.description}\n${skill.excerpt}`.toLowerCase();
   const normalizedTask = task.toLowerCase();
-  let score = matched.length * 14;
-  for (const token of tokens.slice(0, 80)) {
-    if (name.includes(token.value)) score += 4 * token.weight;
-    else if (description.includes(token.value)) score += 1.2 * token.weight;
-  }
+  const lexical = scoreTaskTokens(skill, tokens);
+  let score = matched.length * 14 + lexical.score;
   for (const item of matched) {
     if (item.hints.some((hint) => name.includes(hint))) score += 5;
   }
@@ -701,6 +794,7 @@ function scoreSkill(skill, task, detected, tokens) {
   return {
     ...skill,
     score: Math.max(0, Number(score.toFixed(2))),
+    matchedTerms: lexical.matchedTerms,
     matchedCapabilities: matched.map((item) => item.id),
     infrastructure: INFRASTRUCTURE.test(skill.qualifiedName),
   };
@@ -754,6 +848,7 @@ export function routeTask(task, skills) {
     trustReason: skill.trustReason,
     version: skill.version,
     score: skill.score,
+    matchedTerms: skill.matchedTerms,
     matchedCapabilities: skill.matchedCapabilities,
   });
   const selectedIds = new Set(selected.map((skill) => skill.id));

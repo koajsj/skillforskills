@@ -25,7 +25,8 @@ Skill for Skills 是一个面向 Codex 的本地元 Skill。它会扫描兼容�
 - 返回选中 Skill 的本地 `SKILL.md` 精确路径，方便 Agent 加载对应指令。
 - 使用确定性的目录顺序和来源优先级处理同名 Skill，并公开冲突明细。
 - 在结果中标注 Skill 的来源、根目录和可信度，避免把未知来源误认为受管来源。
-- 对中文长词赋予更高权重，并过滤常见请求套话，减少无关匹配。
+- 使用标准中文词边界组合 2–8 字短语，优先匹配长词并过滤常见请求套话。
+- 对重叠中文子串只计算最高价值命中，避免同一短语被重复加分。
 - Skill 清单始终保留在本地，拒绝扫描整个磁盘或整个用户主目录。
 - 提供零依赖的 Node.js CLI 和本地 JSON API。
 
@@ -69,7 +70,9 @@ $skill-for-skills 帮我把这个 CSV 转换成带图表的 Excel 报告。
 如果没有达到匹配阈值，路由结果会返回空的 `selected`，并将 `unmatched` 设置为
 `true`，避免错误加载无关 Skill。
 
-每个选中项和候选项都会返回 `source`、`root`、`trust` 和 `trustReason`。
+每个选中项和候选项都会返回 `source`、`root`、`trust`、`trustReason` 和
+`matchedTerms`。`matchedTerms` 会列出实际命中的任务短语以及命中名称还是描述，
+便于检查中文路由结果。
 `trust` 可能是 `managed`、`local` 或 `custom`，它只描述来源管理方式，不代表
 Skill 内容已经通过安全审计。
 

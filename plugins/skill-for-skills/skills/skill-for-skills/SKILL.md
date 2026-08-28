@@ -45,6 +45,8 @@ Never recursively route `skill-for-skills` through itself.
   before relying on the route for a high-impact task.
 - If `inventory.conflicts` is non-empty, use the selected source and preserve
   the conflict information when explaining an unexpected route.
+- Use `matchedTerms` to explain or inspect a route. Prefer specific longer
+  phrase matches over generic two-character overlaps.
 - If confidence is `low`, briefly tell the user which Skill was chosen and why
   before beginning a high-impact action.
 - If no useful Skill is found, continue with normal Agent capabilities and say

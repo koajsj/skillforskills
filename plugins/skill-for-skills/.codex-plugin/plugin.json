@@ -1,6 +1,6 @@
 {
   "name": "skill-for-skills",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Automatically discovers, ranks, and loads the best local Skills for an Agent task.",
   "author": {
     "name": "lvhongyu04"
