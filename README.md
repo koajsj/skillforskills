@@ -92,7 +92,3 @@ node plugins/skill-for-skills/skills/skill-for-skills/scripts/skill-router.mjs s
 ## 📄 许可证
 
 本项目基于 [MIT License](LICENSE) 开源。
-
-<p align="center">
-  Made with ❤️ for Codex users
-</p>
