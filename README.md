@@ -7,6 +7,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Codex-Plugin-5B5BD6?style=flat-square" alt="Codex Plugin">
   <img src="https://img.shields.io/badge/Node.js-18%2B-339933?style=flat-square&logo=node.js&logoColor=white" alt="Node.js 18+">
+  <img src="https://img.shields.io/github/actions/workflow/status/koajsj/skillforskills/ci.yml?style=flat-square&label=CI" alt="CI">
   <img src="https://img.shields.io/github/license/koajsj/skillforskills?style=flat-square" alt="License">
 </p>
 
@@ -22,6 +23,9 @@ Skill for Skills 是一个面向 Codex 的本地元 Skill。它会扫描兼容�
   自定义目录中发现 Skill。
 - 选择一个主 Skill，并最多选择两个辅助 Skill。
 - 返回选中 Skill 的本地 `SKILL.md` 精确路径，方便 Agent 加载对应指令。
+- 使用确定性的目录顺序和来源优先级处理同名 Skill，并公开冲突明细。
+- 在结果中标注 Skill 的来源、根目录和可信度，避免把未知来源误认为受管来源。
+- 对中文长词赋予更高权重，并过滤常见请求套话，减少无关匹配。
 - Skill 清单始终保留在本地，拒绝扫描整个磁盘或整个用户主目录。
 - 提供零依赖的 Node.js CLI 和本地 JSON API。
 
@@ -65,6 +69,10 @@ $skill-for-skills 帮我把这个 CSV 转换成带图表的 Excel 报告。
 如果没有达到匹配阈值，路由结果会返回空的 `selected`，并将 `unmatched` 设置为
 `true`，避免错误加载无关 Skill。
 
+每个选中项和候选项都会返回 `source`、`root`、`trust` 和 `trustReason`。
+`trust` 可能是 `managed`、`local` 或 `custom`，它只描述来源管理方式，不代表
+Skill 内容已经通过安全审计。
+
 ## 🛠️ 命令行
 
 ```bash
@@ -81,6 +89,16 @@ node plugins/skill-for-skills/skills/skill-for-skills/scripts/skill-router.mjs a
 node plugins/skill-for-skills/skills/skill-for-skills/scripts/skill-router.mjs serve --port 4319
 ```
 
+`scan` 结果包含以下诊断字段：
+
+- `scan.truncated`：是否有扫描根目录达到文件或目录数量上限。
+- `scan.truncatedRoots`：被截断的根目录及原因。
+- `conflicts`：同名 Skill 的选中来源、忽略来源和选择原因。
+- `roots[].fileCount`、`roots[].directoryCount`：各根目录的实际扫描规模。
+
+默认情况下，每个根目录最多读取 1,500 个 `SKILL.md`，最多遍历 10,000 个目录。
+达到上限时不会静默返回不完整结果。
+
 ## 🔌 本地 API
 
 执行 `serve` 后，服务只会监听 `127.0.0.1`。`/health`、`/skills`、`/roots`
@@ -95,6 +113,8 @@ curl -X POST http://127.0.0.1:4319/roots \
 ```
 
 也可以通过 `SKILL_FOR_SKILLS_API_TOKEN` 环境变量设置固定令牌，便于本地扩展程序连接。
+API 会返回 Skill 的本地绝对路径，因此只能在可信设备上通过本机地址使用，不应通过
+代理转发到局域网或公网。
 
 ## 🔒 隐私与安全
 

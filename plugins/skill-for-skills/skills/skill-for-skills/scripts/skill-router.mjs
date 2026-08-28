@@ -16,10 +16,50 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const MAX_FILES = 1_500;
+const MAX_DIRECTORIES = 10_000;
 const MAX_BYTES = 512 * 1024;
 const CONFIG_DIR = path.join(os.homedir(), ".skill-router");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 const SELF_NAMES = new Set(["skill-for-skills", "skill-for-skills:skill-for-skills"]);
+const SKIPPED_DIRECTORIES = new Set([".git", "node_modules", "dist", "generated_images"]);
+const SOURCE_PRIORITY = {
+  plugin: 500,
+  codex: 400,
+  agents: 300,
+  claude: 250,
+  cursor: 200,
+  opencode: 200,
+  environment: 150,
+  custom: 100,
+};
+const SOURCE_TRUST = {
+  plugin: ["managed", "由 Codex 插件缓存管理"],
+  codex: ["managed", "来自 Codex 管理的 Skill 目录"],
+  agents: ["local", "来自本机 Agent Skill 目录"],
+  claude: ["local", "来自本机 Claude Skill 目录"],
+  cursor: ["local", "来自本机 Cursor Skill 目录"],
+  opencode: ["local", "来自本机 OpenCode Skill 目录"],
+  environment: ["custom", "来自环境变量授权的目录"],
+  custom: ["custom", "来自用户明确添加的目录"],
+};
+const CHINESE_STOP_WORDS = [
+  "帮我",
+  "一下",
+  "这个",
+  "那个",
+  "进行",
+  "一个",
+  "需要",
+  "可以",
+  "如何",
+  "什么",
+  "任务",
+  "功能",
+  "使用",
+  "相关",
+  "请问",
+  "请帮",
+];
 
 const CAPABILITIES = [
   {
@@ -348,38 +388,61 @@ export async function removeCustomRoot(input) {
   return getSkillRoots();
 }
 
-async function findSkillFiles(root) {
+export async function findSkillFiles(
+  root,
+  { maxFiles = MAX_FILES, maxDirectories = MAX_DIRECTORIES } = {},
+) {
   const files = [];
   const pending = [root];
-  while (pending.length && files.length < MAX_FILES) {
+  let scannedDirectories = 0;
+  const truncationReasons = new Set();
+  while (pending.length) {
+    if (scannedDirectories >= maxDirectories) {
+      truncationReasons.add("directory-limit");
+      break;
+    }
     const current = pending.pop();
+    scannedDirectories += 1;
     let entries = [];
     try {
       entries = await readdir(current, { withFileTypes: true });
     } catch {
       continue;
     }
+    entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
+    const directories = [];
     for (const entry of entries) {
       if (entry.isSymbolicLink()) continue;
-      if (
-        entry.isDirectory() &&
-        [".git", "node_modules", "dist", "generated_images"].includes(entry.name)
-      ) {
+      if (entry.isDirectory() && SKIPPED_DIRECTORIES.has(entry.name)) {
         continue;
       }
       const target = path.join(current, entry.name);
-      if (entry.isDirectory()) pending.push(target);
-      if (entry.isFile() && entry.name === "SKILL.md") files.push(target);
-      if (files.length >= MAX_FILES) break;
+      if (entry.isDirectory()) directories.push(target);
+      if (entry.isFile() && entry.name === "SKILL.md") {
+        if (files.length >= maxFiles) {
+          truncationReasons.add("file-limit");
+          break;
+        }
+        files.push(target);
+      }
+    }
+    if (truncationReasons.has("file-limit")) break;
+    for (let index = directories.length - 1; index >= 0; index -= 1) {
+      pending.push(directories[index]);
     }
   }
-  return files;
+  return {
+    files,
+    scannedDirectories,
+    truncated: truncationReasons.size > 0,
+    truncationReasons: [...truncationReasons],
+  };
 }
 
 async function nearestPlugin(filePath, rootPath) {
   let cursor = path.dirname(filePath);
-  const boundary = path.dirname(rootPath);
-  while (cursor.startsWith(boundary)) {
+  const boundary = path.resolve(rootPath);
+  while (cursor === boundary || cursor.startsWith(`${boundary}${path.sep}`)) {
     try {
       const manifest = JSON.parse(
         await readFile(path.join(cursor, ".codex-plugin", "plugin.json"), "utf8"),
@@ -420,6 +483,11 @@ async function loadSkill(filePath, root) {
   const qualifiedName =
     plugin?.name && !name.includes(":") ? `${plugin.name}:${name}` : name;
   if (SELF_NAMES.has(name) || SELF_NAMES.has(qualifiedName)) return null;
+  const source = root.kind;
+  const [trust, trustReason] = SOURCE_TRUST[source] || [
+    "custom",
+    "来自未分类的本地目录",
+  ];
   const excerpt = parsed.body
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/[#>*_[\]`]/g, " ")
@@ -432,7 +500,11 @@ async function loadSkill(filePath, root) {
     description: parsed.description || excerpt.slice(0, 240),
     excerpt,
     filePath,
-    source: plugin ? "plugin" : root.kind,
+    source,
+    rootKind: root.kind,
+    rootPath: root.path,
+    trust,
+    trustReason,
     version: plugin?.version || null,
     requiresSetup: /(?:api[_ -]?key|需要登录|requires? (?:an? )?(?:api key|login))/i.test(
       `${parsed.frontmatter}\n${excerpt}`,
@@ -441,55 +513,165 @@ async function loadSkill(filePath, root) {
       /(?:use|trigger)(?: this skill)? only when the user (?:selects|names|explicitly|asks)|use when the user (?:selects|names)|仅当用户(?:选择|点名|明确)/i.test(
         parsed.description,
       ),
-    modifiedAt: fileStat.mtimeMs,
   };
   skill.capabilities = detectCapabilities(skill);
   return skill;
 }
 
-export async function scanSkillInventory() {
-  const roots = await getSkillRoots();
+function compareSkillSource(left, right) {
+  return (
+    (SOURCE_PRIORITY[right.source] || 0) - (SOURCE_PRIORITY[left.source] || 0) ||
+    left.filePath.localeCompare(right.filePath, "en")
+  );
+}
+
+function skillOrigin(skill) {
+  return {
+    filePath: skill.filePath,
+    source: skill.source,
+    rootKind: skill.rootKind,
+    rootPath: skill.rootPath,
+    trust: skill.trust,
+    trustReason: skill.trustReason,
+    version: skill.version,
+  };
+}
+
+export async function scanSkillInventory(
+  { roots: providedRoots, maxFiles = MAX_FILES, maxDirectories = MAX_DIRECTORIES } = {},
+) {
+  const roots = (providedRoots || (await getSkillRoots())).map((root) => ({
+    ...root,
+    available: root.available !== false,
+    displayPath: root.displayPath || displayPath(root.path),
+  }));
   const groups = await Promise.all(
-    roots
-      .filter((root) => root.available)
-      .map(async (root) =>
-        (await findSkillFiles(root.path)).map((filePath) => ({ filePath, root })),
-      ),
+    roots.map(async (root) => {
+      if (!root.available) {
+        return {
+          root,
+          files: [],
+          scannedDirectories: 0,
+          truncated: false,
+          truncationReasons: [],
+        };
+      }
+      return {
+        root,
+        ...(await findSkillFiles(root.path, { maxFiles, maxDirectories })),
+      };
+    }),
   );
   const loaded = await Promise.all(
-    groups.flat().map(({ filePath, root }) => loadSkill(filePath, root)),
+    groups.flatMap((group) =>
+      group.files.map((filePath) => loadSkill(filePath, group.root)),
+    ),
   );
-  const unique = new Map();
+  const candidates = new Map();
   for (const skill of loaded.filter(Boolean)) {
-    const current = unique.get(skill.qualifiedName);
-    if (!current || skill.modifiedAt > current.modifiedAt) {
-      unique.set(skill.qualifiedName, skill);
+    const matches = candidates.get(skill.qualifiedName) || [];
+    matches.push(skill);
+    candidates.set(skill.qualifiedName, matches);
+  }
+  const unique = new Map();
+  const conflicts = [];
+  for (const [qualifiedName, matches] of candidates) {
+    matches.sort(compareSkillSource);
+    const [selected, ...ignored] = matches;
+    unique.set(qualifiedName, selected);
+    if (ignored.length) {
+      const selectedPriority = SOURCE_PRIORITY[selected.source] || 0;
+      conflicts.push({
+        id: qualifiedName,
+        selected: skillOrigin(selected),
+        ignored: ignored.map((skill) => ({
+          ...skillOrigin(skill),
+          reason:
+            (SOURCE_PRIORITY[skill.source] || 0) < selectedPriority
+              ? "lower-source-priority"
+              : "stable-path-tiebreak",
+        })),
+      });
     }
   }
   const skills = [...unique.values()].sort((left, right) =>
     left.qualifiedName.localeCompare(right.qualifiedName, "zh-CN"),
   );
+  conflicts.sort((left, right) => left.id.localeCompare(right.id, "zh-CN"));
   const counts = {};
   for (const skill of skills) counts[skill.source] = (counts[skill.source] || 0) + 1;
-  return { skills, total: skills.length, counts, roots, scannedAt: new Date().toISOString() };
+  const rootResults = groups.map((group) => ({
+    ...group.root,
+    fileCount: group.files.length,
+    directoryCount: group.scannedDirectories,
+    truncated: group.truncated,
+    truncationReasons: group.truncationReasons,
+  }));
+  const truncatedRoots = rootResults
+    .filter((root) => root.truncated)
+    .map((root) => ({
+      kind: root.kind,
+      path: root.displayPath,
+      reasons: root.truncationReasons,
+    }));
+  return {
+    skills,
+    total: skills.length,
+    counts,
+    roots: rootResults,
+    scan: {
+      truncated: truncatedRoots.length > 0,
+      truncatedRoots,
+      discoveredFiles: groups.reduce((total, group) => total + group.files.length, 0),
+      scannedDirectories: groups.reduce(
+        (total, group) => total + group.scannedDirectories,
+        0,
+      ),
+      limits: { maxFilesPerRoot: maxFiles, maxDirectoriesPerRoot: maxDirectories },
+    },
+    conflicts,
+    scannedAt: new Date().toISOString(),
+  };
 }
 
 function taskTokens(task) {
   const normalized = task.toLowerCase();
-  const tokens = new Set(normalized.match(/[a-z0-9][a-z0-9+#._-]{1,}/g) || []);
-  for (const token of [...tokens]) {
-    for (const part of token.split(/[-_.]/)) if (part.length >= 2) tokens.add(part);
+  const tokens = new Map();
+  const addToken = (value, weight) => {
+    if (value.length < 2) return;
+    tokens.set(value, Math.max(tokens.get(value) || 0, weight));
+  };
+  const english = normalized.match(/[a-z0-9][a-z0-9+#._-]{1,}/g) || [];
+  for (const token of english) {
+    addToken(token, 1);
+    for (const part of token.split(/[-_.]/)) addToken(part, 0.9);
   }
   for (const run of normalized.match(/[\u3400-\u9fff]{2,}/g) || []) {
-    const value = run.slice(0, 40);
-    for (let size = 2; size <= Math.min(4, value.length); size += 1) {
-      for (let index = 0; index <= value.length - size; index += 1) {
-        tokens.add(value.slice(index, index + size));
-        if (tokens.size >= 160) return [...tokens];
+    let segmented = run.slice(0, 60);
+    for (const stopWord of CHINESE_STOP_WORDS) {
+      segmented = segmented.split(stopWord).join(" ");
+    }
+    for (const value of segmented.split(/\s+/).filter(Boolean)) {
+      if (value.length >= 2 && value.length <= 12) addToken(value, 2.8);
+      for (const size of [4, 3, 2]) {
+        if (size > value.length) continue;
+        const weight = size === 4 ? 2.2 : size === 3 ? 1.5 : 0.65;
+        for (let index = 0; index <= value.length - size; index += 1) {
+          const token = value.slice(index, index + size);
+          if (!CHINESE_STOP_WORDS.includes(token)) addToken(token, weight);
+        }
       }
     }
   }
-  return [...tokens];
+  return [...tokens.entries()]
+    .map(([value, weight]) => ({ value, weight }))
+    .sort(
+      (left, right) =>
+        right.weight - left.weight ||
+        right.value.length - left.value.length ||
+        left.value.localeCompare(right.value, "zh-CN"),
+    )
+    .slice(0, 120);
 }
 
 function scoreSkill(skill, task, detected, tokens) {
@@ -499,8 +681,8 @@ function scoreSkill(skill, task, detected, tokens) {
   const normalizedTask = task.toLowerCase();
   let score = matched.length * 14;
   for (const token of tokens.slice(0, 80)) {
-    if (name.includes(token)) score += 4;
-    else if (description.includes(token)) score += 1.2;
+    if (name.includes(token.value)) score += 4 * token.weight;
+    else if (description.includes(token.value)) score += 1.2 * token.weight;
   }
   for (const item of matched) {
     if (item.hints.some((hint) => name.includes(hint))) score += 5;
@@ -529,8 +711,9 @@ export function routeTask(task, skills) {
   if (!cleanTask) throw new Error("任务内容不能为空");
   if (cleanTask.length > 4_000) throw new Error("任务内容不能超过 4000 个字符");
   const detected = detectTaskCapabilities(cleanTask);
+  const tokens = taskTokens(cleanTask);
   const ranked = skills
-    .map((skill) => scoreSkill(skill, cleanTask, detected, taskTokens(cleanTask)))
+    .map((skill) => scoreSkill(skill, cleanTask, detected, tokens))
     .sort(
       (left, right) =>
         right.score - left.score ||
@@ -565,6 +748,10 @@ export function routeTask(task, skills) {
       )?.reason || skill.description,
     filePath: skill.filePath,
     source: skill.source,
+    rootKind: skill.rootKind,
+    root: skill.rootPath ? displayPath(skill.rootPath) : null,
+    trust: skill.trust,
+    trustReason: skill.trustReason,
     version: skill.version,
     score: skill.score,
     matchedCapabilities: skill.matchedCapabilities,
@@ -600,15 +787,25 @@ export async function routeWithInventory(task) {
     inventory: {
       total: inventory.total,
       counts: inventory.counts,
+      scan: inventory.scan,
+      conflicts: inventory.conflicts,
       scannedAt: inventory.scannedAt,
-      roots: inventory.roots.map(({ kind, label, displayPath: rootPath, automatic, available }) => ({
-        kind,
-        label,
-        path: rootPath,
-        automatic,
-        available,
-      })),
+      roots: inventory.roots.map(publicRoot),
     },
+  };
+}
+
+function publicRoot(root) {
+  return {
+    kind: root.kind,
+    label: root.label,
+    path: root.displayPath,
+    automatic: root.automatic,
+    available: root.available,
+    fileCount: root.fileCount,
+    directoryCount: root.directoryCount,
+    truncated: root.truncated,
+    truncationReasons: root.truncationReasons,
   };
 }
 
@@ -616,19 +813,19 @@ function publicInventory(inventory) {
   return {
     total: inventory.total,
     counts: inventory.counts,
+    scan: inventory.scan,
+    conflicts: inventory.conflicts,
     scannedAt: inventory.scannedAt,
-    roots: inventory.roots.map(({ kind, label, displayPath: rootPath, automatic, available }) => ({
-      kind,
-      label,
-      path: rootPath,
-      automatic,
-      available,
-    })),
+    roots: inventory.roots.map(publicRoot),
     skills: inventory.skills.map((skill) => ({
       name: skill.qualifiedName,
       description: skill.description,
       filePath: skill.filePath,
       source: skill.source,
+      rootKind: skill.rootKind,
+      root: displayPath(skill.rootPath),
+      trust: skill.trust,
+      trustReason: skill.trustReason,
       version: skill.version,
       capabilities: skill.capabilities,
     })),

@@ -39,6 +39,12 @@ Never recursively route `skill-for-skills` through itself.
 - Prefer one Skill that fully covers the task over several overlapping Skills.
 - Respect setup, login, safety, and approval requirements in every loaded
   Skill. Routing never grants extra permission.
+- Treat `trust` as source provenance, not a security certification. Inspect
+  unfamiliar `custom` Skills before using them for sensitive work.
+- If `inventory.scan.truncated` is true, mention that discovery was incomplete
+  before relying on the route for a high-impact task.
+- If `inventory.conflicts` is non-empty, use the selected source and preserve
+  the conflict information when explaining an unexpected route.
 - If confidence is `low`, briefly tell the user which Skill was chosen and why
   before beginning a high-impact action.
 - If no useful Skill is found, continue with normal Agent capabilities and say
