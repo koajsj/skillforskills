@@ -9,6 +9,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -22,9 +23,25 @@ const SELF_NAMES = new Set(["skill-for-skills", "skill-for-skills:skill-for-skil
 
 const CAPABILITIES = [
   {
-    id: "audit",
+    id: "security",
+    label: "安全审查",
+    task: /(?:安全(?:性)?(?:审查|审核|评估|扫描|检测)?|security|漏洞|渗透|威胁模型|攻击面|依赖安全|\bcve\b|\bxss\b|\bcsrf\b|\bsqli\b)/i,
+    skill: /(?:security|vulnerability|attack path|threat model|security scan|安全扫描|安全审查)/i,
+    reason: "负责识别安全风险、验证攻击路径并输出安全审查结果",
+    hints: ["security", "vulnerability", "threat"],
+  },
+  {
+    id: "code-review",
+    label: "代码审查",
+    task: /(?:代码\s*(?:审查|评审)|代码\s*review|code\s*review|review\s*(?:code|pr|pull request)|(?:pr|pull request)\s*(?:review|审查))/i,
+    skill: /(?:code review|review.*(?:code|pull request|repository)|review-agent|代码审查|审查代码)/i,
+    reason: "负责审查代码变更、识别回归风险并提出可执行问题",
+    hints: ["review", "code-review"],
+  },
+  {
+    id: "ux-audit",
     label: "体验审查",
-    task: /(?:ux|ui|体验|审核|审查|评审|可用性|无障碍|audit|critique|review|onboarding|checkout)/i,
+    task: /(?:\bux\b|\bui\b|用户体验|体验(?:审查|审核|评估)?|可用性|无障碍|accessibility|usability|onboarding|checkout|design critique|视觉审查)/i,
     skill: /(?:\baudit\b|\bcritique\b|user experience|\bux\b|usability|accessibility|体验审查|可用性)/i,
     reason: "负责体验审查、问题分析与报告输出",
     hints: ["audit", "ux"],
@@ -96,7 +113,7 @@ const CAPABILITIES = [
   {
     id: "code",
     label: "代码开发",
-    task: /(?:写代码|开发|实现功能|修复bug|重构|代码审查|前端|后端|接口|脚本|coding|implement|debug|refactor|frontend|backend|api)/i,
+    task: /(?:写代码|开发|实现(?:新)?功能|修复bug|重构|前端|后端|接口|脚本|coding|implement|debug|refactor|frontend|backend|api)/i,
     skill: /(?:code|coding|implementation|developer|frontend|backend|\bapi\b|debug|repository|codebase)/i,
     reason: "负责实现、修改或验证代码",
     hints: ["code", "implement", "developer"],
@@ -161,6 +178,12 @@ function cleanScalar(value) {
   return text;
 }
 
+function blockScalarStyle(value) {
+  const marker = value.trim();
+  const match = marker.match(/^([>|])(?:(?:[1-9][+-]?)|(?:[+-][1-9]?))?$/);
+  return match?.[1] || null;
+}
+
 export function parseSkillDocument(content) {
   const match = content.match(/^---\s*\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   const frontmatter = match?.[1] || "";
@@ -170,13 +193,14 @@ export function parseSkillDocument(content) {
     for (let index = 0; index < lines.length; index += 1) {
       const found = lines[index].match(pattern);
       if (!found) continue;
-      if (!["|", ">"].includes(found[1].trim())) return cleanScalar(found[1]);
+      const style = blockScalarStyle(found[1]);
+      if (!style) return cleanScalar(found[1]);
       const block = [];
       for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
         if (!/^\s+/.test(lines[cursor])) break;
         block.push(lines[cursor].trim());
       }
-      return block.join(found[1].trim() === ">" ? " " : "\n");
+      return block.join(style === ">" ? " " : "\n");
     }
     return "";
   };
@@ -278,13 +302,14 @@ function normalizeCustomRoot(input) {
         ? path.join(os.homedir(), trimmed.slice(2))
         : trimmed;
   const normalized = path.resolve(expanded);
-  if (
-    normalized === path.parse(normalized).root ||
-    normalized === os.homedir()
-  ) {
+  if (isProtectedRoot(normalized)) {
     throw new Error("为保护隐私，不能扫描整块磁盘或整个用户目录");
   }
   return normalized;
+}
+
+function isProtectedRoot(candidate) {
+  return candidate === path.parse(candidate).root || candidate === os.homedir();
 }
 
 export async function addCustomRoot(input) {
@@ -294,6 +319,9 @@ export async function addCustomRoot(input) {
     resolved = await realpath(normalized);
   } catch {
     throw new Error("找不到这个文件夹");
+  }
+  if (isProtectedRoot(resolved)) {
+    throw new Error("为保护隐私，不能扫描整块磁盘或整个用户目录");
   }
   if (!(await stat(resolved)).isDirectory()) throw new Error("所选路径不是文件夹");
   const config = await readConfig();
@@ -375,6 +403,10 @@ function detectCapabilities(skill) {
   return CAPABILITIES.filter((item) => item.skill.test(searchable)).map(
     (item) => item.id,
   );
+}
+
+function detectTaskCapabilities(task) {
+  return CAPABILITIES.filter((item) => item.task.test(task));
 }
 
 async function loadSkill(filePath, root) {
@@ -496,7 +528,7 @@ export function routeTask(task, skills) {
   const cleanTask = String(task || "").trim();
   if (!cleanTask) throw new Error("任务内容不能为空");
   if (cleanTask.length > 4_000) throw new Error("任务内容不能超过 4000 个字符");
-  const detected = CAPABILITIES.filter((item) => item.task.test(cleanTask));
+  const detected = detectTaskCapabilities(cleanTask);
   const ranked = skills
     .map((skill) => scoreSkill(skill, cleanTask, detected, taskTokens(cleanTask)))
     .sort(
@@ -508,9 +540,7 @@ export function routeTask(task, skills) {
   const nonInfrastructure = meaningful.filter((skill) => !skill.infrastructure);
   const browserOnly = detected.length === 1 && detected[0]?.id === "browser";
   const primary =
-    (browserOnly ? meaningful[0] : nonInfrastructure[0]) ||
-    meaningful[0] ||
-    ranked[0];
+    (browserOnly ? meaningful[0] : nonInfrastructure[0]) || meaningful[0] || null;
   const selected = primary ? [primary] : [];
   const covered = new Set(primary?.matchedCapabilities || []);
   for (const capability of detected) {
@@ -545,12 +575,13 @@ export function routeTask(task, skills) {
     .filter((skill) => !selectedIds.has(skill.id))
     .slice(0, 5)
     .map((skill, index) => format(skill, index + 1));
-  const coverage = detected.length ? covered.size / detected.length : primary?.score >= 4 ? 0.55 : 0.2;
+  const coverage = detected.length ? covered.size / detected.length : primary?.score >= 4 ? 0.55 : 0;
   return {
     task: cleanTask,
     detectedCapabilities: detected.map(({ id, label }) => ({ id, label })),
     selected: selectedOutput,
     alternatives,
+    unmatched: !primary,
     confidence:
       primary?.score >= 18 && coverage >= 0.7
         ? "high"
@@ -623,7 +654,29 @@ function sendJson(response, status, value) {
   response.end(JSON.stringify(value));
 }
 
-export function startServer(port = 4319) {
+function createWriteToken(value) {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (typeof process.env.SKILL_FOR_SKILLS_API_TOKEN === "string" && process.env.SKILL_FOR_SKILLS_API_TOKEN.trim()) {
+    return process.env.SKILL_FOR_SKILLS_API_TOKEN.trim();
+  }
+  return randomBytes(32).toString("hex");
+}
+
+function hasWriteAuthorization(request, token) {
+  const authorization = request.headers.authorization || "";
+  const fallback = request.headers["x-skill-for-skills-token"] || "";
+  const candidate =
+    typeof authorization === "string" && /^Bearer\s+/i.test(authorization)
+      ? authorization.replace(/^Bearer\s+/i, "")
+      : fallback;
+  if (typeof candidate !== "string") return false;
+  const candidateBuffer = Buffer.from(candidate);
+  const tokenBuffer = Buffer.from(token);
+  return candidateBuffer.length === tokenBuffer.length && timingSafeEqual(candidateBuffer, tokenBuffer);
+}
+
+export function startServer(port = 4319, { writeToken } = {}) {
+  const token = createWriteToken(writeToken);
   const server = http.createServer(async (request, response) => {
     try {
       const url = new URL(request.url || "/", "http://127.0.0.1");
@@ -639,6 +692,11 @@ export function startServer(port = 4319) {
       if (request.method === "POST" && url.pathname === "/route") {
         const body = await readBody(request);
         return sendJson(response, 200, await routeWithInventory(body.task));
+      }
+      const isRootWrite =
+        (request.method === "POST" || request.method === "DELETE") && url.pathname === "/roots";
+      if (isRootWrite && !hasWriteAuthorization(request, token)) {
+        return sendJson(response, 401, { error: "需要 API 写入令牌" });
       }
       if (request.method === "POST" && url.pathname === "/roots") {
         const body = await readBody(request);
@@ -657,7 +715,9 @@ export function startServer(port = 4319) {
   });
   server.listen(port, "127.0.0.1", () => {
     console.log(`Skill for Skills listening on http://127.0.0.1:${port}`);
+    console.log(`API write token: ${token}`);
   });
+  server.writeToken = token;
   return server;
 }
 

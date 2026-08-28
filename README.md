@@ -62,6 +62,9 @@ $skill-for-skills 帮我把这个 CSV 转换成带图表的 Excel 报告。
 为这个任务寻找并加载最合适的本地 Skill。
 ```
 
+如果没有达到匹配阈值，路由结果会返回空的 `selected`，并将 `unmatched` 设置为
+`true`，避免错误加载无关 Skill。
+
 ## 🛠️ 命令行
 
 ```bash
@@ -78,16 +81,38 @@ node plugins/skill-for-skills/skills/skill-for-skills/scripts/skill-router.mjs a
 node plugins/skill-for-skills/skills/skill-for-skills/scripts/skill-router.mjs serve --port 4319
 ```
 
+## 🔌 本地 API
+
+执行 `serve` 后，服务只会监听 `127.0.0.1`。`/health`、`/skills`、`/roots`
+和 `/route` 为只读接口；新增或删除自定义目录时，需要携带启动时输出的 API
+写入令牌：
+
+```bash
+curl -X POST http://127.0.0.1:4319/roots \
+  -H "Authorization: Bearer <API_WRITE_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"path":"/path/to/skills"}'
+```
+
+也可以通过 `SKILL_FOR_SKILLS_API_TOKEN` 环境变量设置固定令牌，便于本地扩展程序连接。
+
 ## 🔒 隐私与安全
 
 路由器只会从已知的兼容位置，以及用户明确添加的目录中读取 `SKILL.md` 文件。
 它不会上传本地 Skill 清单。路由过程也不会绕过所选 Skill 的权限、配置步骤或
-安全要求。
+安全要求。为保护隐私，不能把整个磁盘、整个用户目录，或解析后指向用户目录的
+符号链接添加为自定义扫描目录。
 
 ## 📦 运行要求
 
 - 支持插件的 Codex
 - Node.js 18 或更高版本
+
+运行回归测试：
+
+```bash
+npm test
+```
 
 ## 📄 许可证
 
