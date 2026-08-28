@@ -1,52 +1,49 @@
 # Skill for Skills
 
-Skill for Skills is a local Meta Skill for Codex. It scans compatible local
-`SKILL.md` files, matches them to the current task, and returns the smallest
-useful ordered route of primary and supporting Skills.
+Skill for Skills 是一个面向 Codex 的本地元 Skill。它会扫描兼容位置中的
+`SKILL.md` 文件，根据当前任务进行匹配，并返回由主 Skill 和辅助 Skill
+组成的最小可用执行路径。
 
-## What it does
+## 功能
 
-- Discovers Skills from Codex, Claude, Cursor, OpenCode, `.agents/skills`, and
-  user-approved custom directories.
-- Selects a primary Skill and up to two supporting Skills.
-- Returns the exact local `SKILL.md` paths so the Agent can load the selected
-  instructions.
-- Keeps the inventory local and rejects whole-disk or whole-home scans.
-- Provides a dependency-free Node.js CLI and a localhost JSON API.
+- 从 Codex、Claude、Cursor、OpenCode、`.agents/skills` 以及用户明确授权的
+  自定义目录中发现 Skill。
+- 选择一个主 Skill，并最多选择两个辅助 Skill。
+- 返回选中 Skill 的本地 `SKILL.md` 精确路径，方便 Agent 加载对应指令。
+- Skill 清单始终保留在本地，拒绝扫描整个磁盘或整个用户主目录。
+- 提供零依赖的 Node.js CLI 和本地 JSON API。
 
-## Install
-
-Replace `<owner>` with the GitHub owner of this repository:
+## 安装
 
 ```bash
-codex plugin marketplace add hongyulyu714-prog/skill-for-skills
+codex plugin marketplace add koajsj/skillforskills
 codex plugin add skill-for-skills@skill-for-skills
 ```
 
-Restart Codex and start a new task after installation.
+安装完成后，重启 Codex 并新建一个任务。
 
-## Use
+## 使用
 
-Invoke it explicitly:
-
-```text
-$skill-for-skills Help me turn this CSV into an Excel report with charts.
-```
-
-Or ask Codex to select local Skills:
+显式调用：
 
 ```text
-Find and load the best local Skills for this task.
+$skill-for-skills 帮我把这个 CSV 转换成带图表的 Excel 报告。
 ```
 
-## CLI
+或者直接让 Codex 选择本地 Skill：
+
+```text
+为这个任务寻找并加载最合适的本地 Skill。
+```
+
+## 命令行
 
 ```bash
 node plugins/skill-for-skills/skills/skill-for-skills/scripts/skill-router.mjs \
-  route --task "Create a quarterly presentation"
+  route --task "创建季度汇报演示文稿"
 ```
 
-Other commands:
+其他命令：
 
 ```bash
 node plugins/skill-for-skills/skills/skill-for-skills/scripts/skill-router.mjs scan
@@ -55,18 +52,17 @@ node plugins/skill-for-skills/skills/skill-for-skills/scripts/skill-router.mjs a
 node plugins/skill-for-skills/skills/skill-for-skills/scripts/skill-router.mjs serve --port 4319
 ```
 
-## Privacy and safety
+## 隐私与安全
 
-The router reads `SKILL.md` files only from known compatible locations and
-directories explicitly added by the user. It does not upload the local
-inventory. Routing does not bypass the permissions, setup steps, or safety
-requirements of the selected Skills.
+路由器只会从已知的兼容位置，以及用户明确添加的目录中读取 `SKILL.md` 文件。
+它不会上传本地 Skill 清单。路由过程也不会绕过所选 Skill 的权限、配置步骤或
+安全要求。
 
-## Requirements
+## 运行要求
 
-- Codex with plugin support
-- Node.js 18 or newer
+- 支持插件的 Codex
+- Node.js 18 或更高版本
 
-## License
+## 许可证
 
 MIT
