@@ -27,6 +27,8 @@ Skill for Skills 是一个面向 Codex 的本地元 Skill。它会扫描兼容�
 - 在结果中标注 Skill 的来源、根目录和可信度，避免把未知来源误认为受管来源。
 - 使用标准中文词边界组合 2–8 字短语，优先匹配长词并过滤常见请求套话。
 - 对重叠中文子串只计算最高价值命中，避免同一短语被重复加分。
+- 本地 API 缓存 Skill 清单并合并并发扫描，减少重复文件遍历。
+- 提供受写入令牌保护的手动刷新，并返回缓存命中和时效诊断。
 - Skill 清单始终保留在本地，拒绝扫描整个磁盘或整个用户主目录。
 - 提供零依赖的 Node.js CLI 和本地 JSON API。
 
@@ -89,13 +91,15 @@ node plugins/skill-for-skills/skills/skill-for-skills/scripts/skill-router.mjs \
 node plugins/skill-for-skills/skills/skill-for-skills/scripts/skill-router.mjs scan
 node plugins/skill-for-skills/skills/skill-for-skills/scripts/skill-router.mjs roots
 node plugins/skill-for-skills/skills/skill-for-skills/scripts/skill-router.mjs add-root "/path/to/skills"
-node plugins/skill-for-skills/skills/skill-for-skills/scripts/skill-router.mjs serve --port 4319
+node plugins/skill-for-skills/skills/skill-for-skills/scripts/skill-router.mjs serve \
+  --port 4319 --cache-ttl 30000
 ```
 
 `scan` 结果包含以下诊断字段：
 
 - `scan.truncated`：是否有扫描根目录达到文件或目录数量上限。
 - `scan.truncatedRoots`：被截断的根目录及原因。
+- `scan.blockedRoots`：因隐私保护而拒绝扫描的磁盘根目录或用户主目录。
 - `conflicts`：同名 Skill 的选中来源、忽略来源和选择原因。
 - `roots[].fileCount`、`roots[].directoryCount`：各根目录的实际扫描规模。
 
@@ -104,15 +108,22 @@ node plugins/skill-for-skills/skills/skill-for-skills/scripts/skill-router.mjs s
 
 ## 🔌 本地 API
 
-执行 `serve` 后，服务只会监听 `127.0.0.1`。`/health`、`/skills`、`/roots`
-和 `/route` 为只读接口；新增或删除自定义目录时，需要携带启动时输出的 API
-写入令牌：
+执行 `serve` 后，服务只会监听 `127.0.0.1`。Skill 清单默认缓存 30 秒，可通过
+`--cache-ttl` 或 `SKILL_FOR_SKILLS_CACHE_TTL_MS` 调整为 0–3,600,000 毫秒。
+并发请求会共享同一次扫描，`/health`、`/skills` 和 `/route` 会返回缓存状态。
+
+`/health`、`/skills`、`/roots` 和 `/route` 为只读接口；新增或删除自定义目录，
+或调用 `POST /refresh` 强制刷新清单时，需要携带启动时生成的一次性令牌，或通过
+环境变量配置的固定 API 写入令牌：
 
 ```bash
 curl -X POST http://127.0.0.1:4319/roots \
   -H "Authorization: Bearer <API_WRITE_TOKEN>" \
   -H "Content-Type: application/json" \
   -d '{"path":"/path/to/skills"}'
+
+curl -X POST http://127.0.0.1:4319/refresh \
+  -H "Authorization: Bearer <API_WRITE_TOKEN>"
 ```
 
 也可以通过 `SKILL_FOR_SKILLS_API_TOKEN` 环境变量设置固定令牌，便于本地扩展程序连接。
@@ -123,8 +134,8 @@ API 会返回 Skill 的本地绝对路径，因此只能在可信设备上通过
 
 路由器只会从已知的兼容位置，以及用户明确添加的目录中读取 `SKILL.md` 文件。
 它不会上传本地 Skill 清单。路由过程也不会绕过所选 Skill 的权限、配置步骤或
-安全要求。为保护隐私，不能把整个磁盘、整个用户目录，或解析后指向用户目录的
-符号链接添加为自定义扫描目录。
+安全要求。为保护隐私，不能把整个磁盘、整个用户目录、包含用户主目录的上级目录，
+或解析后指向这些位置的符号链接添加为自定义扫描目录。
 
 ## 📦 运行要求
 

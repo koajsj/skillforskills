@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 
 import {
+  chmod,
   mkdir,
   readFile,
   readdir,
   realpath,
   rename,
   stat,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { randomBytes, timingSafeEqual } from "node:crypto";
@@ -18,6 +20,10 @@ import { pathToFileURL } from "node:url";
 const MAX_FILES = 1_500;
 const MAX_DIRECTORIES = 10_000;
 const MAX_BYTES = 512 * 1024;
+const MAX_CONCURRENT_READS = 32;
+const MAX_REQUEST_BYTES = 16 * 1024;
+const DEFAULT_CACHE_TTL_MS = 30_000;
+const MAX_CACHE_TTL_MS = 60 * 60 * 1_000;
 const CONFIG_DIR = path.join(os.homedir(), ".skill-router");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 const SELF_NAMES = new Set(["skill-for-skills", "skill-for-skills:skill-for-skills"]);
@@ -182,7 +188,7 @@ const CAPABILITIES = [
   {
     id: "code",
     label: "代码开发",
-    task: /(?:写代码|开发|实现(?:新)?功能|修复bug|重构|前端|后端|接口|脚本|coding|implement|debug|refactor|frontend|backend|api)/i,
+    task: /(?:写代码|开发|实现(?:新)?功能|修复bug|重构|前端|后端|接口|脚本|coding|implement|debug|refactor|frontend|backend|\bapi\b)/i,
     skill: /(?:code|coding|implementation|developer|frontend|backend|\bapi\b|debug|repository|codebase)/i,
     reason: "负责实现、修改或验证代码",
     hints: ["code", "implement", "developer"],
@@ -231,8 +237,20 @@ const CAPABILITIES = [
 
 const INFRASTRUCTURE = /(?:control-in-app-browser|control-chrome|excel-live-control|figma-use(?:$|:|-))/i;
 
+class RouterInputError extends Error {
+  constructor(message, status = 400, code = "invalid_request") {
+    super(message);
+    this.name = "RouterInputError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+let configMutationQueue = Promise.resolve();
+
 function displayPath(value) {
   const home = os.homedir();
+  if (value === home) return "~";
   return value.startsWith(`${home}${path.sep}`) ? `~${value.slice(home.length)}` : value;
 }
 
@@ -284,21 +302,60 @@ export function parseSkillDocument(content) {
 async function readConfig() {
   try {
     const value = JSON.parse(await readFile(CONFIG_FILE, "utf8"));
+    if (
+      !value ||
+      typeof value !== "object" ||
+      !Array.isArray(value.customRoots) ||
+      value.customRoots.some((item) => typeof item !== "string")
+    ) {
+      throw new RouterInputError(
+        `配置文件格式无效：${CONFIG_FILE}`,
+        500,
+        "invalid_config",
+      );
+    }
     return {
-      customRoots: Array.isArray(value.customRoots)
-        ? value.customRoots.filter((item) => typeof item === "string")
-        : [],
+      customRoots: value.customRoots.map((item) => item.trim()).filter(Boolean),
     };
-  } catch {
-    return { customRoots: [] };
+  } catch (error) {
+    if (error?.code === "ENOENT") return { customRoots: [] };
+    if (error instanceof RouterInputError) throw error;
+    if (error instanceof SyntaxError) {
+      throw new RouterInputError(
+        `配置文件不是有效 JSON：${CONFIG_FILE}`,
+        500,
+        "invalid_config",
+      );
+    }
+    throw error;
   }
 }
 
 async function writeConfig(config) {
-  await mkdir(CONFIG_DIR, { recursive: true });
-  const temporary = `${CONFIG_FILE}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, "utf8");
-  await rename(temporary, CONFIG_FILE);
+  await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  await chmod(CONFIG_DIR, 0o700);
+  const temporary = `${CONFIG_FILE}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    await rename(temporary, CONFIG_FILE);
+    await chmod(CONFIG_FILE, 0o600);
+  } finally {
+    await unlink(temporary).catch(() => {});
+  }
+}
+
+function updateConfig(mutator) {
+  const update = configMutationQueue.then(async () => {
+    const config = await readConfig();
+    await mutator(config);
+    await writeConfig(config);
+  });
+  configMutationQueue = update.catch(() => {});
+  return update;
 }
 
 function automaticRoots() {
@@ -349,19 +406,25 @@ export async function getSkillRoots() {
   const output = [];
   for (const root of unique.values()) {
     let available = false;
+    const blockedReason = isProtectedRoot(root.path) ? "protected-root" : null;
     try {
-      available = (await stat(root.path)).isDirectory();
+      available = !blockedReason && (await stat(root.path)).isDirectory();
     } catch {
       available = false;
     }
-    output.push({ ...root, available, displayPath: displayPath(root.path) });
+    output.push({
+      ...root,
+      available,
+      blockedReason,
+      displayPath: displayPath(root.path),
+    });
   }
   return output;
 }
 
-function normalizeCustomRoot(input) {
+function normalizeCustomRoot(input, { allowProtected = false } = {}) {
   if (typeof input !== "string" || !input.trim()) {
-    throw new Error("请输入具体的 Skill 文件夹路径");
+    throw new RouterInputError("请输入具体的 Skill 文件夹路径");
   }
   const trimmed = input.trim();
   const expanded =
@@ -371,14 +434,21 @@ function normalizeCustomRoot(input) {
         ? path.join(os.homedir(), trimmed.slice(2))
         : trimmed;
   const normalized = path.resolve(expanded);
-  if (isProtectedRoot(normalized)) {
-    throw new Error("为保护隐私，不能扫描整块磁盘或整个用户目录");
+  if (!allowProtected && isProtectedRoot(normalized)) {
+    throw new RouterInputError("为保护隐私，不能扫描整块磁盘或整个用户目录");
   }
   return normalized;
 }
 
 function isProtectedRoot(candidate) {
-  return candidate === path.parse(candidate).root || candidate === os.homedir();
+  const home = os.homedir();
+  const relativeHome = path.relative(candidate, home);
+  const containsHome =
+    relativeHome === "" ||
+    (relativeHome !== ".." &&
+      !relativeHome.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(relativeHome));
+  return candidate === path.parse(candidate).root || containsHome;
 }
 
 export async function addCustomRoot(input) {
@@ -387,33 +457,33 @@ export async function addCustomRoot(input) {
   try {
     resolved = await realpath(normalized);
   } catch {
-    throw new Error("找不到这个文件夹");
+    throw new RouterInputError("找不到这个文件夹");
   }
   if (isProtectedRoot(resolved)) {
-    throw new Error("为保护隐私，不能扫描整块磁盘或整个用户目录");
+    throw new RouterInputError("为保护隐私，不能扫描整块磁盘或整个用户目录");
   }
-  if (!(await stat(resolved)).isDirectory()) throw new Error("所选路径不是文件夹");
-  const config = await readConfig();
-  if (!config.customRoots.includes(resolved)) {
-    config.customRoots.push(resolved);
-    await writeConfig(config);
+  if (!(await stat(resolved)).isDirectory()) {
+    throw new RouterInputError("所选路径不是文件夹");
   }
+  await updateConfig((config) => {
+    if (!config.customRoots.includes(resolved)) config.customRoots.push(resolved);
+  });
   return getSkillRoots();
 }
 
 export async function removeCustomRoot(input) {
-  const normalized = normalizeCustomRoot(input);
+  const normalized = normalizeCustomRoot(input, { allowProtected: true });
   let resolved = normalized;
   try {
     resolved = await realpath(normalized);
   } catch {
     // Missing directories can still be removed from configuration.
   }
-  const config = await readConfig();
-  config.customRoots = config.customRoots.filter(
-    (item) => item !== resolved && item !== normalized,
-  );
-  await writeConfig(config);
+  await updateConfig((config) => {
+    config.customRoots = config.customRoots.filter(
+      (item) => item !== resolved && item !== normalized,
+    );
+  });
   return getSkillRoots();
 }
 
@@ -501,6 +571,23 @@ function detectTaskCapabilities(task) {
   return CAPABILITIES.filter((item) => item.task.test(task));
 }
 
+async function mapWithConcurrency(items, limit, mapper) {
+  const output = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from(
+    { length: Math.min(Math.max(1, limit), items.length) },
+    async () => {
+      while (cursor < items.length) {
+        const index = cursor;
+        cursor += 1;
+        output[index] = await mapper(items[index], index);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return output;
+}
+
 async function loadSkill(filePath, root) {
   const fileStat = await stat(filePath).catch(() => null);
   if (!fileStat || fileStat.size > MAX_BYTES) return null;
@@ -569,11 +656,31 @@ function skillOrigin(skill) {
 export async function scanSkillInventory(
   { roots: providedRoots, maxFiles = MAX_FILES, maxDirectories = MAX_DIRECTORIES } = {},
 ) {
-  const roots = (providedRoots || (await getSkillRoots())).map((root) => ({
-    ...root,
-    available: root.available !== false,
-    displayPath: root.displayPath || displayPath(root.path),
-  }));
+  const configuredRoots = providedRoots || (await getSkillRoots());
+  const roots = await Promise.all(
+    configuredRoots.map(async (root) => {
+      if (!root || typeof root.path !== "string" || !root.path.trim()) {
+        throw new RouterInputError("Skill 根目录路径无效");
+      }
+      const absolutePath = path.resolve(root.path);
+      let resolvedPath = absolutePath;
+      try {
+        resolvedPath = await realpath(absolutePath);
+      } catch {
+        // Unavailable roots remain visible in diagnostics.
+      }
+      const blockedReason =
+        root.blockedReason ||
+        (isProtectedRoot(resolvedPath) ? "protected-root" : null);
+      return {
+        ...root,
+        path: absolutePath,
+        blockedReason,
+        available: root.available !== false && !blockedReason,
+        displayPath: displayPath(absolutePath),
+      };
+    }),
+  );
   const groups = await Promise.all(
     roots.map(async (root) => {
       if (!root.available) {
@@ -591,10 +698,13 @@ export async function scanSkillInventory(
       };
     }),
   );
-  const loaded = await Promise.all(
-    groups.flatMap((group) =>
-      group.files.map((filePath) => loadSkill(filePath, group.root)),
-    ),
+  const skillFiles = groups.flatMap((group) =>
+    group.files.map((filePath) => ({ filePath, root: group.root })),
+  );
+  const loaded = await mapWithConcurrency(
+    skillFiles,
+    MAX_CONCURRENT_READS,
+    ({ filePath, root }) => loadSkill(filePath, root),
   );
   const candidates = new Map();
   for (const skill of loaded.filter(Boolean)) {
@@ -643,6 +753,13 @@ export async function scanSkillInventory(
       path: root.displayPath,
       reasons: root.truncationReasons,
     }));
+  const blockedRoots = rootResults
+    .filter((root) => root.blockedReason)
+    .map((root) => ({
+      kind: root.kind,
+      path: root.displayPath,
+      reason: root.blockedReason,
+    }));
   return {
     skills,
     total: skills.length,
@@ -651,12 +768,17 @@ export async function scanSkillInventory(
     scan: {
       truncated: truncatedRoots.length > 0,
       truncatedRoots,
+      blockedRoots,
       discoveredFiles: groups.reduce((total, group) => total + group.files.length, 0),
       scannedDirectories: groups.reduce(
         (total, group) => total + group.scannedDirectories,
         0,
       ),
-      limits: { maxFilesPerRoot: maxFiles, maxDirectoriesPerRoot: maxDirectories },
+      limits: {
+        maxFilesPerRoot: maxFiles,
+        maxDirectoriesPerRoot: maxDirectories,
+        maxConcurrentReads: MAX_CONCURRENT_READS,
+      },
     },
     conflicts,
     scannedAt: new Date().toISOString(),
@@ -800,10 +922,20 @@ function scoreSkill(skill, task, detected, tokens) {
   };
 }
 
+function normalizeTask(task) {
+  if (typeof task !== "string") {
+    throw new RouterInputError("任务内容必须是字符串");
+  }
+  const cleanTask = task.trim();
+  if (!cleanTask) throw new RouterInputError("任务内容不能为空");
+  if (cleanTask.length > 4_000) {
+    throw new RouterInputError("任务内容不能超过 4000 个字符");
+  }
+  return cleanTask;
+}
+
 export function routeTask(task, skills) {
-  const cleanTask = String(task || "").trim();
-  if (!cleanTask) throw new Error("任务内容不能为空");
-  if (cleanTask.length > 4_000) throw new Error("任务内容不能超过 4000 个字符");
+  const cleanTask = normalizeTask(task);
   const detected = detectTaskCapabilities(cleanTask);
   const tokens = taskTokens(cleanTask);
   const ranked = skills
@@ -832,10 +964,10 @@ export function routeTask(task, skills) {
       helper.matchedCapabilities.forEach((item) => covered.add(item));
     }
   }
-  const format = (skill, index) => ({
+  const format = (skill, role) => ({
     id: skill.id,
     name: skill.qualifiedName,
-    role: index === 0 ? "主 Skill" : "辅助 Skill",
+    role,
     reason:
       CAPABILITIES.find((item) =>
         skill.matchedCapabilities.includes(item.id),
@@ -852,11 +984,13 @@ export function routeTask(task, skills) {
     matchedCapabilities: skill.matchedCapabilities,
   });
   const selectedIds = new Set(selected.map((skill) => skill.id));
-  const selectedOutput = selected.map(format);
+  const selectedOutput = selected.map((skill, index) =>
+    format(skill, index === 0 ? "主 Skill" : "辅助 Skill"),
+  );
   const alternatives = meaningful
     .filter((skill) => !selectedIds.has(skill.id))
     .slice(0, 5)
-    .map((skill, index) => format(skill, index + 1));
+    .map((skill) => format(skill, "候选 Skill"));
   const coverage = detected.length ? covered.size / detected.length : primary?.score >= 4 ? 0.55 : 0;
   return {
     task: cleanTask,
@@ -875,8 +1009,95 @@ export function routeTask(task, skills) {
   };
 }
 
-export async function routeWithInventory(task) {
-  const inventory = await scanSkillInventory();
+function normalizeCacheTtl(value) {
+  const environmentValue = process.env.SKILL_FOR_SKILLS_CACHE_TTL_MS;
+  const resolved =
+    value ??
+    (typeof environmentValue === "string" && environmentValue.trim()
+      ? environmentValue
+      : DEFAULT_CACHE_TTL_MS);
+  const ttlMs = Number(resolved);
+  if (!Number.isInteger(ttlMs) || ttlMs < 0 || ttlMs > MAX_CACHE_TTL_MS) {
+    throw new RouterInputError(
+      `缓存时间必须是 0 到 ${MAX_CACHE_TTL_MS} 之间的整数毫秒`,
+    );
+  }
+  return ttlMs;
+}
+
+export function createInventoryCache({
+  scanInventory = scanSkillInventory,
+  ttlMs,
+  now = Date.now,
+} = {}) {
+  const resolvedTtlMs = normalizeCacheTtl(ttlMs);
+  let cachedInventory = null;
+  let cachedAt = 0;
+  let inFlight = null;
+  let generation = 0;
+
+  const status = () => {
+    const ageMs = cachedInventory ? Math.max(0, now() - cachedAt) : null;
+    return {
+      ready: Boolean(cachedInventory),
+      refreshing: Boolean(inFlight),
+      stale: ageMs !== null && ageMs >= resolvedTtlMs,
+      ageMs,
+      ttlMs: resolvedTtlMs,
+    };
+  };
+
+  const load = async (force) => {
+    const ageMs = cachedInventory ? Math.max(0, now() - cachedAt) : null;
+    if (!force && cachedInventory && ageMs < resolvedTtlMs) {
+      return {
+        inventory: cachedInventory,
+        cache: { ...status(), hit: true, coalesced: false },
+      };
+    }
+    if (inFlight) {
+      const activeScan = inFlight;
+      const inventory = await activeScan.promise;
+      if (activeScan.generation !== generation) return load(true);
+      return {
+        inventory,
+        cache: { ...status(), hit: false, coalesced: true },
+      };
+    }
+
+    const scan = Promise.resolve().then(() => scanInventory());
+    const activeScan = { promise: scan, generation };
+    inFlight = activeScan;
+    let inventory;
+    try {
+      inventory = await scan;
+      if (activeScan.generation === generation) {
+        cachedInventory = inventory;
+        cachedAt = now();
+      }
+    } finally {
+      if (inFlight === activeScan) inFlight = null;
+    }
+    if (activeScan.generation !== generation) return load(true);
+    return {
+      inventory,
+      cache: { ...status(), hit: false, coalesced: false },
+    };
+  };
+
+  return {
+    get: () => load(false),
+    refresh: () => load(true),
+    invalidate() {
+      generation += 1;
+      cachedInventory = null;
+      cachedAt = 0;
+    },
+    status,
+  };
+}
+
+function routeInventory(task, inventory, cache = null) {
   return {
     ...routeTask(task, inventory.skills),
     inventory: {
@@ -886,8 +1107,14 @@ export async function routeWithInventory(task) {
       conflicts: inventory.conflicts,
       scannedAt: inventory.scannedAt,
       roots: inventory.roots.map(publicRoot),
+      ...(cache ? { cache } : {}),
     },
   };
+}
+
+export async function routeWithInventory(task) {
+  const inventory = await scanSkillInventory();
+  return routeInventory(task, inventory);
 }
 
 function publicRoot(root) {
@@ -897,6 +1124,7 @@ function publicRoot(root) {
     path: root.displayPath,
     automatic: root.automatic,
     available: root.available,
+    blockedReason: root.blockedReason,
     fileCount: root.fileCount,
     directoryCount: root.directoryCount,
     truncated: root.truncated,
@@ -904,13 +1132,14 @@ function publicRoot(root) {
   };
 }
 
-function publicInventory(inventory) {
+function publicInventory(inventory, cache = null) {
   return {
     total: inventory.total,
     counts: inventory.counts,
     scan: inventory.scan,
     conflicts: inventory.conflicts,
     scannedAt: inventory.scannedAt,
+    ...(cache ? { cache } : {}),
     roots: inventory.roots.map(publicRoot),
     skills: inventory.skills.map((skill) => ({
       name: skill.qualifiedName,
@@ -928,30 +1157,68 @@ function publicInventory(inventory) {
 }
 
 async function readBody(request) {
+  const contentType = String(request.headers["content-type"] || "")
+    .split(";", 1)[0]
+    .trim()
+    .toLowerCase();
+  if (contentType !== "application/json") {
+    throw new RouterInputError(
+      "请求必须使用 application/json",
+      415,
+      "unsupported_media_type",
+    );
+  }
+  const contentLength = Number(request.headers["content-length"] || 0);
+  if (Number.isFinite(contentLength) && contentLength > MAX_REQUEST_BYTES) {
+    throw new RouterInputError("请求内容过大", 413, "payload_too_large");
+  }
   const chunks = [];
   let bytes = 0;
   for await (const chunk of request) {
     bytes += chunk.length;
-    if (bytes > 16 * 1024) throw new Error("请求内容过大");
+    if (bytes > MAX_REQUEST_BYTES) {
+      throw new RouterInputError("请求内容过大", 413, "payload_too_large");
+    }
     chunks.push(chunk);
   }
-  return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
+  if (!chunks.length) return {};
+  try {
+    const value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new RouterInputError(
+        "请求内容必须是 JSON 对象",
+        400,
+        "invalid_body",
+      );
+    }
+    return value;
+  } catch (error) {
+    if (error instanceof RouterInputError) throw error;
+    throw new RouterInputError("请求内容不是有效 JSON", 400, "invalid_json");
+  }
 }
 
-function sendJson(response, status, value) {
+function sendJson(response, status, value, headers = {}) {
   response.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    ...headers,
   });
   response.end(JSON.stringify(value));
 }
 
 function createWriteToken(value) {
-  if (typeof value === "string" && value.trim()) return value.trim();
-  if (typeof process.env.SKILL_FOR_SKILLS_API_TOKEN === "string" && process.env.SKILL_FOR_SKILLS_API_TOKEN.trim()) {
-    return process.env.SKILL_FOR_SKILLS_API_TOKEN.trim();
+  if (typeof value === "string" && value.trim()) {
+    return { token: value.trim(), generated: false };
   }
-  return randomBytes(32).toString("hex");
+  if (typeof process.env.SKILL_FOR_SKILLS_API_TOKEN === "string" && process.env.SKILL_FOR_SKILLS_API_TOKEN.trim()) {
+    return {
+      token: process.env.SKILL_FOR_SKILLS_API_TOKEN.trim(),
+      generated: false,
+    };
+  }
+  return { token: randomBytes(32).toString("hex"), generated: true };
 }
 
 function hasWriteAuthorization(request, token) {
@@ -967,55 +1234,114 @@ function hasWriteAuthorization(request, token) {
   return candidateBuffer.length === tokenBuffer.length && timingSafeEqual(candidateBuffer, tokenBuffer);
 }
 
-export function startServer(port = 4319, { writeToken } = {}) {
-  const token = createWriteToken(writeToken);
+export function startServer(
+  port = 4319,
+  { writeToken, cacheTtlMs, scanInventory, logger = console } = {},
+) {
+  const { token, generated: generatedToken } = createWriteToken(writeToken);
+  const inventoryCache = createInventoryCache({ scanInventory, ttlMs: cacheTtlMs });
   const server = http.createServer(async (request, response) => {
     try {
       const url = new URL(request.url || "/", "http://127.0.0.1");
       if (request.method === "GET" && url.pathname === "/health") {
-        return sendJson(response, 200, { ok: true, name: "skill-for-skills" });
+        return sendJson(response, 200, {
+          ok: true,
+          name: "skill-for-skills",
+          cache: inventoryCache.status(),
+        });
       }
       if (request.method === "GET" && url.pathname === "/skills") {
-        return sendJson(response, 200, publicInventory(await scanSkillInventory()));
+        const { inventory, cache } = await inventoryCache.get();
+        return sendJson(response, 200, publicInventory(inventory, cache));
       }
       if (request.method === "GET" && url.pathname === "/roots") {
         return sendJson(response, 200, await getSkillRoots());
       }
       if (request.method === "POST" && url.pathname === "/route") {
         const body = await readBody(request);
-        return sendJson(response, 200, await routeWithInventory(body.task));
+        const task = normalizeTask(body.task);
+        const { inventory, cache } = await inventoryCache.get();
+        return sendJson(response, 200, routeInventory(task, inventory, cache));
       }
-      const isRootWrite =
-        (request.method === "POST" || request.method === "DELETE") && url.pathname === "/roots";
-      if (isRootWrite && !hasWriteAuthorization(request, token)) {
+      const requiresWriteAuthorization =
+        (url.pathname === "/roots" &&
+          (request.method === "POST" || request.method === "DELETE")) ||
+        (url.pathname === "/refresh" && request.method === "POST");
+      if (requiresWriteAuthorization && !hasWriteAuthorization(request, token)) {
         return sendJson(response, 401, { error: "需要 API 写入令牌" });
+      }
+      if (request.method === "POST" && url.pathname === "/refresh") {
+        const { inventory, cache } = await inventoryCache.refresh();
+        return sendJson(response, 200, publicInventory(inventory, cache));
       }
       if (request.method === "POST" && url.pathname === "/roots") {
         const body = await readBody(request);
-        return sendJson(response, 201, await addCustomRoot(body.path));
+        const roots = await addCustomRoot(body.path);
+        inventoryCache.invalidate();
+        return sendJson(response, 201, roots);
       }
       if (request.method === "DELETE" && url.pathname === "/roots") {
         const body = await readBody(request);
-        return sendJson(response, 200, await removeCustomRoot(body.path));
+        const roots = await removeCustomRoot(body.path);
+        inventoryCache.invalidate();
+        return sendJson(response, 200, roots);
+      }
+      const allowedMethods = {
+        "/health": "GET",
+        "/skills": "GET",
+        "/route": "POST",
+        "/roots": "GET, POST, DELETE",
+        "/refresh": "POST",
+      };
+      if (allowedMethods[url.pathname]) {
+        return sendJson(
+          response,
+          405,
+          { error: "Method not allowed" },
+          { allow: allowedMethods[url.pathname] },
+        );
       }
       return sendJson(response, 404, { error: "Not found" });
     } catch (error) {
-      return sendJson(response, 400, {
-        error: error instanceof Error ? error.message : "Router failed",
+      if (error instanceof RouterInputError) {
+        return sendJson(response, error.status, {
+          error: error.status >= 500 ? "Router failed" : error.message,
+          code: error.code,
+        });
+      }
+      logger?.error?.("Skill for Skills request failed", error);
+      return sendJson(response, 500, {
+        error: "Router failed",
+        code: "internal_error",
       });
     }
   });
+  server.headersTimeout = 5_000;
+  server.requestTimeout = 10_000;
+  server.keepAliveTimeout = 5_000;
+  server.maxRequestsPerSocket = 100;
   server.listen(port, "127.0.0.1", () => {
-    console.log(`Skill for Skills listening on http://127.0.0.1:${port}`);
-    console.log(`API write token: ${token}`);
+    const address = server.address();
+    const listeningPort = typeof address === "object" && address ? address.port : port;
+    logger?.log?.(`Skill for Skills listening on http://127.0.0.1:${listeningPort}`);
+    logger?.log?.(
+      generatedToken
+        ? `API write token: ${token}`
+        : "API write token configured externally",
+    );
   });
   server.writeToken = token;
+  server.inventoryCache = inventoryCache;
   return server;
 }
 
 function optionValue(args, name) {
   const index = args.indexOf(name);
-  return index >= 0 ? args[index + 1] : undefined;
+  if (index < 0) return undefined;
+  if (index === args.length - 1) {
+    throw new RouterInputError(`选项 ${name} 缺少值`);
+  }
+  return args[index + 1];
 }
 
 async function main(args = process.argv.slice(2)) {
@@ -1035,9 +1361,9 @@ async function main(args = process.argv.slice(2)) {
   } else if (command === "serve") {
     const port = Number(optionValue(args, "--port") || 4319);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new Error("端口必须是 1 到 65535 之间的整数");
+      throw new RouterInputError("端口必须是 1 到 65535 之间的整数");
     }
-    startServer(port);
+    startServer(port, { cacheTtlMs: optionValue(args, "--cache-ttl") });
     return;
   } else {
     throw new Error(

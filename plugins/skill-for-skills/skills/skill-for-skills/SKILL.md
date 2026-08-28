@@ -71,8 +71,13 @@ node "<this-skill-directory>/scripts/skill-router.mjs" add-root "/path/to/skills
 node "<this-skill-directory>/scripts/skill-router.mjs" remove-root "/path/to/skills"
 
 # Start the localhost API used by a future browser extension
-node "<this-skill-directory>/scripts/skill-router.mjs" serve --port 4319
+node "<this-skill-directory>/scripts/skill-router.mjs" serve --port 4319 --cache-ttl 30000
 ```
 
+The local API caches the discovered inventory for 30 seconds by default and
+coalesces concurrent scans. Use the authenticated `POST /refresh` endpoint when
+an installed Skill must become visible immediately.
+
 Do not add a directory unless the user supplied or approved it. Reject the
-filesystem root and the entire home directory.
+filesystem root, the entire home directory, its ancestors, and symlinks that
+resolve to those protected locations.
