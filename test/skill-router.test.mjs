@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -218,6 +218,25 @@ test("requires a token before changing custom roots through the local API", asyn
     });
     assert.equal(authorized.status, 400);
     assert.match((await authorized.json()).error, /不能扫描整块磁盘/);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("does not log a generated API write token", async () => {
+  const messages = [];
+  const server = startServer(0, {
+    logger: {
+      log(message) {
+        messages.push(message);
+      },
+    },
+  });
+  await new Promise((resolve) => server.once("listening", resolve));
+
+  try {
+    assert.equal(messages.some((message) => /API write token: [a-f0-9]{64}/i.test(message)), false);
+    assert.equal(messages.some((message) => message.includes("generated and redacted")), true);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
@@ -455,6 +474,54 @@ test("scans Skill files in deterministic path order", async () => {
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+});
+
+test("scans valid Skills and reports sensitive-content keyword warnings", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "skill-router-sensitive-"));
+  try {
+    await mkdir(path.join(tempDir, "safe-skill"), { recursive: true });
+    await writeFile(
+      path.join(tempDir, "safe-skill", "SKILL.md"),
+      "---\nname: safe-skill\ndescription: Generate images\n---\nConfigure an API_KEY before use.\n",
+      "utf8",
+    );
+
+    const result = await scanSkillInventory({ roots: [root("custom", tempDir)] });
+
+    assert.equal(result.total, 1);
+    assert.deepEqual(result.skills[0].sensitiveContentWarnings, ["api_key"]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("skips empty and unreadable Skill files without aborting the scan", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "skill-router-unreadable-"));
+  const unreadableFile = path.join(tempDir, "unreadable", "SKILL.md");
+  try {
+    await mkdir(path.join(tempDir, "empty"), { recursive: true });
+    await writeFile(path.join(tempDir, "empty", "SKILL.md"), "", "utf8");
+    await writeSkill(path.dirname(unreadableFile), "unreadable");
+    await chmod(unreadableFile, 0o000);
+
+    const result = await scanSkillInventory({ roots: [root("custom", tempDir)] });
+
+    assert.equal(result.total, 0);
+  } finally {
+    await chmod(unreadableFile, 0o644).catch(() => {});
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("redacts the home directory from routed Skill paths", () => {
+  const homeSkill = skill("image-helper", ["image"], "Generate images");
+  homeSkill.filePath = path.join(os.homedir(), ".codex", "skills", "image", "SKILL.md");
+  homeSkill.rootPath = path.join(os.homedir(), ".codex", "skills");
+
+  const result = routeTask("Generate an image", [homeSkill]);
+
+  assert.equal(result.selected[0].filePath, "~/.codex/skills/image/SKILL.md");
+  assert.equal(result.selected[0].root, "~/.codex/skills");
 });
 
 test("blocks protected roots even when supplied outside custom-root validation", async () => {

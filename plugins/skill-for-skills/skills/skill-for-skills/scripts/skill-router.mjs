@@ -48,6 +48,13 @@ const SOURCE_TRUST = {
   environment: ["custom", "来自环境变量授权的目录"],
   custom: ["custom", "来自用户明确添加的目录"],
 };
+const SENSITIVE_CONTENT_PATTERNS = [
+  ["password", /\bpassword\b/i],
+  ["token", /\btoken\b/i],
+  ["secret", /\bsecret\b/i],
+  ["api_key", /\bapi[ _-]?key\b/i],
+  ["private_key", /\bprivate[ _-]?key\b/i],
+];
 const MAX_CHINESE_PHRASE_LENGTH = 8;
 const CHINESE_BOUNDARY_WORDS = new Set([
   "请",
@@ -249,6 +256,7 @@ class RouterInputError extends Error {
 let configMutationQueue = Promise.resolve();
 
 function displayPath(value) {
+  if (typeof value !== "string") return value;
   const home = os.homedir();
   if (value === home) return "~";
   return value.startsWith(`${home}${path.sep}`) ? `~${value.slice(home.length)}` : value;
@@ -589,49 +597,58 @@ async function mapWithConcurrency(items, limit, mapper) {
 }
 
 async function loadSkill(filePath, root) {
-  const fileStat = await stat(filePath).catch(() => null);
-  if (!fileStat || fileStat.size > MAX_BYTES) return null;
-  const content = await readFile(filePath, "utf8").catch(() => "");
-  if (!content) return null;
-  const parsed = parseSkillDocument(content);
-  const name = parsed.name || path.basename(path.dirname(filePath));
-  const plugin = await nearestPlugin(filePath, root.path);
-  const qualifiedName =
-    plugin?.name && !name.includes(":") ? `${plugin.name}:${name}` : name;
-  if (SELF_NAMES.has(name) || SELF_NAMES.has(qualifiedName)) return null;
-  const source = root.kind;
-  const [trust, trustReason] = SOURCE_TRUST[source] || [
-    "custom",
-    "来自未分类的本地目录",
-  ];
-  const excerpt = parsed.body
-    .replace(/```[\s\S]*?```/g, " ")
-    .replace(/[#>*_[\]`]/g, " ")
-    .replace(/\s+/g, " ")
-    .slice(0, 2_000);
-  const skill = {
-    id: qualifiedName,
-    name,
-    qualifiedName,
-    description: parsed.description || excerpt.slice(0, 240),
-    excerpt,
-    filePath,
-    source,
-    rootKind: root.kind,
-    rootPath: root.path,
-    trust,
-    trustReason,
-    version: plugin?.version || null,
-    requiresSetup: /(?:api[_ -]?key|需要登录|requires? (?:an? )?(?:api key|login))/i.test(
-      `${parsed.frontmatter}\n${excerpt}`,
-    ),
-    explicitSelectionOnly:
-      /(?:use|trigger)(?: this skill)? only when the user (?:selects|names|explicitly|asks)|use when the user (?:selects|names)|仅当用户(?:选择|点名|明确)/i.test(
-        parsed.description,
+  try {
+    const fileStat = await stat(filePath);
+    if (!fileStat.isFile() || fileStat.size > MAX_BYTES) return null;
+    const content = await readFile(filePath, "utf8");
+    if (!content) return null;
+    const parsed = parseSkillDocument(content);
+    const name = parsed.name || path.basename(path.dirname(filePath));
+    const plugin = await nearestPlugin(filePath, root.path);
+    const qualifiedName =
+      plugin?.name && !name.includes(":") ? `${plugin.name}:${name}` : name;
+    if (SELF_NAMES.has(name) || SELF_NAMES.has(qualifiedName)) return null;
+    const source = root.kind;
+    const [trust, trustReason] = SOURCE_TRUST[source] || [
+      "custom",
+      "来自未分类的本地目录",
+    ];
+    const excerpt = parsed.body
+      .replace(/```[\s\S]*?```/g, " ")
+      .replace(/[#>*_[\]`]/g, " ")
+      .replace(/\s+/g, " ")
+      .slice(0, 2_000);
+    const sensitiveContentWarnings = SENSITIVE_CONTENT_PATTERNS
+      .filter(([, pattern]) => pattern.test(content))
+      .map(([label]) => label);
+    const skill = {
+      id: qualifiedName,
+      name,
+      qualifiedName,
+      description: parsed.description || excerpt.slice(0, 240),
+      excerpt,
+      filePath,
+      source,
+      rootKind: root.kind,
+      rootPath: root.path,
+      trust,
+      trustReason,
+      version: plugin?.version || null,
+      sensitiveContentWarnings,
+      requiresSetup: /(?:api[_ -]?key|需要登录|requires? (?:an? )?(?:api key|login))/i.test(
+        `${parsed.frontmatter}\n${excerpt}`,
       ),
-  };
-  skill.capabilities = detectCapabilities(skill);
-  return skill;
+      explicitSelectionOnly:
+        /(?:use|trigger)(?: this skill)? only when the user (?:selects|names|explicitly|asks)|use when the user (?:selects|names)|仅当用户(?:选择|点名|明确)/i.test(
+          parsed.description,
+        ),
+    };
+    skill.capabilities = detectCapabilities(skill);
+    return skill;
+  } catch {
+    // A malformed, unreadable, or concurrently removed Skill must not abort the scan.
+    return null;
+  }
 }
 
 function compareSkillSource(left, right) {
@@ -704,7 +721,7 @@ export async function scanSkillInventory(
   const loaded = await mapWithConcurrency(
     skillFiles,
     MAX_CONCURRENT_READS,
-    ({ filePath, root }) => loadSkill(filePath, root),
+    ({ filePath, root }) => loadSkill(filePath, root).catch(() => null),
   );
   const candidates = new Map();
   for (const skill of loaded.filter(Boolean)) {
@@ -972,13 +989,14 @@ export function routeTask(task, skills) {
       CAPABILITIES.find((item) =>
         skill.matchedCapabilities.includes(item.id),
       )?.reason || skill.description,
-    filePath: skill.filePath,
+    filePath: displayPath(skill.filePath),
     source: skill.source,
     rootKind: skill.rootKind,
     root: skill.rootPath ? displayPath(skill.rootPath) : null,
     trust: skill.trust,
     trustReason: skill.trustReason,
     version: skill.version,
+    sensitiveContentWarnings: skill.sensitiveContentWarnings || [],
     score: skill.score,
     matchedTerms: skill.matchedTerms,
     matchedCapabilities: skill.matchedCapabilities,
@@ -1137,14 +1155,18 @@ function publicInventory(inventory, cache = null) {
     total: inventory.total,
     counts: inventory.counts,
     scan: inventory.scan,
-    conflicts: inventory.conflicts,
+    conflicts: inventory.conflicts.map((conflict) => ({
+      ...conflict,
+      selected: publicSkillOrigin(conflict.selected),
+      ignored: conflict.ignored.map(publicSkillOrigin),
+    })),
     scannedAt: inventory.scannedAt,
     ...(cache ? { cache } : {}),
     roots: inventory.roots.map(publicRoot),
     skills: inventory.skills.map((skill) => ({
       name: skill.qualifiedName,
       description: skill.description,
-      filePath: skill.filePath,
+      filePath: displayPath(skill.filePath),
       source: skill.source,
       rootKind: skill.rootKind,
       root: displayPath(skill.rootPath),
@@ -1152,7 +1174,16 @@ function publicInventory(inventory, cache = null) {
       trustReason: skill.trustReason,
       version: skill.version,
       capabilities: skill.capabilities,
+      sensitiveContentWarnings: skill.sensitiveContentWarnings || [],
     })),
+  };
+}
+
+function publicSkillOrigin(origin) {
+  return {
+    ...origin,
+    filePath: displayPath(origin.filePath),
+    rootPath: displayPath(origin.rootPath),
   };
 }
 
@@ -1326,7 +1357,7 @@ export function startServer(
     logger?.log?.(`Skill for Skills listening on http://127.0.0.1:${listeningPort}`);
     logger?.log?.(
       generatedToken
-        ? `API write token: ${token}`
+        ? "API write token generated and redacted; set SKILL_FOR_SKILLS_API_TOKEN to use write endpoints from the CLI"
         : "API write token configured externally",
     );
   });
