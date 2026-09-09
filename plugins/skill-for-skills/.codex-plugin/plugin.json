@@ -3,14 +3,14 @@
   "version": "0.3.0",
   "description": "Automatically discovers, ranks, and loads the best local Skills for an Agent task.",
   "author": {
-    "name": "lvhongyu04"
+    "name": "kikou"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Skill for Skills",
     "shortDescription": "Automatically route tasks to the best local Skills.",
     "longDescription": "Scans compatible local Skill directories, ranks installed Skills against the current task, and gives the Agent an ordered route with local SKILL.md paths.",
-    "developerName": "lvhongyu04",
+    "developerName": "kikou",
     "category": "Productivity",
     "capabilities": [
       "Local Skill discovery",
