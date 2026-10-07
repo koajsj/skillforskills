@@ -17,6 +17,8 @@ Skill for Skills 是一个面向 Codex 的本地元 Skill。它会扫描兼容�
 `SKILL.md` 文件，根据当前任务进行匹配，并返回由主 Skill 和辅助 Skill
 组成的最小可用执行路径。
 
+发布者：`kikou`
+
 ## 🌟 功能
 
 - 从 Codex、Claude、Cursor、OpenCode、`.agents/skills` 以及用户明确授权的
