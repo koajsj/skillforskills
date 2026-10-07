@@ -39,14 +39,6 @@ Never recursively route `skill-for-skills` through itself.
 - Prefer one Skill that fully covers the task over several overlapping Skills.
 - Respect setup, login, safety, and approval requirements in every loaded
   Skill. Routing never grants extra permission.
-- Treat `trust` as source provenance, not a security certification. Inspect
-  unfamiliar `custom` Skills before using them for sensitive work.
-- If `inventory.scan.truncated` is true, mention that discovery was incomplete
-  before relying on the route for a high-impact task.
-- If `inventory.conflicts` is non-empty, use the selected source and preserve
-  the conflict information when explaining an unexpected route.
-- Use `matchedTerms` to explain or inspect a route. Prefer specific longer
-  phrase matches over generic two-character overlaps.
 - If confidence is `low`, briefly tell the user which Skill was chosen and why
   before beginning a high-impact action.
 - If no useful Skill is found, continue with normal Agent capabilities and say
@@ -71,13 +63,8 @@ node "<this-skill-directory>/scripts/skill-router.mjs" add-root "/path/to/skills
 node "<this-skill-directory>/scripts/skill-router.mjs" remove-root "/path/to/skills"
 
 # Start the localhost API used by a future browser extension
-node "<this-skill-directory>/scripts/skill-router.mjs" serve --port 4319 --cache-ttl 30000
+node "<this-skill-directory>/scripts/skill-router.mjs" serve --port 4319
 ```
 
-The local API caches the discovered inventory for 30 seconds by default and
-coalesces concurrent scans. Use the authenticated `POST /refresh` endpoint when
-an installed Skill must become visible immediately.
-
 Do not add a directory unless the user supplied or approved it. Reject the
-filesystem root, the entire home directory, its ancestors, and symlinks that
-resolve to those protected locations.
+filesystem root and the entire home directory.
