@@ -2,7 +2,7 @@
 
 Skill for Skills 是一个运行在本机的 Codex Meta Skill。它会扫描本机可用的 Agent Skills，根据任务内容进行匹配和排序，并返回需要加载的 `SKILL.md` 文件路径。
 
-发布者：**kikou**
+发布者：**koajsj**
 
 ## ✨ 功能
 
@@ -104,4 +104,4 @@ curl -X POST http://127.0.0.1:4319/route \
 
 ## 📄 许可证
 
-MIT © 2026 kikou
+MIT © 2026 koajsj
